@@ -13,6 +13,9 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <netdb.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -58,6 +61,14 @@ struct ofi_ep {
 	struct fid_cq *dial_rx_cq;
 	void          *dest_addr;
 	size_t         dest_addrlen;
+	/* TCP sideband fields for CXI/RDM OOB address exchange */
+	int            rdm_tcp_fd;       /* TCP listen/connect fd; -1 = unused */
+	uint16_t       rdm_url_port;     /* URL port saved for sideband */
+	char          *rdm_dest_host;    /* dialer: peer hostname */
+	struct fid_cq *rdm_tcq;         /* listener: shared tx CQ */
+	struct fid_cq *rdm_rcq;         /* listener: shared rx CQ */
+	nni_thr        rdm_sideband_thr;
+	bool           rdm_sideband_started;
 };
 
 struct ofi_pipe {
@@ -262,6 +273,70 @@ static nng_err ofi_pipe_alloc(ofi_ep *ep, struct fid_ep *fid_ep, struct fid_cq *
 	return 0;
 }
 
+/* Exchange a fabric address over a connected TCP socket.
+ * Protocol: 4-byte LE length, then raw address bytes. Bidirectional. */
+static int
+ofi_sideband_exchange(int sock, struct fid *fid,
+    void **peer_addr_out, size_t *peer_addrlen_out)
+{
+	/* Get local fabric address */
+	size_t local_len = 0;
+	fi_getname(fid, NULL, &local_len);
+	void *local_addr = malloc(local_len);
+	if (fi_getname(fid, local_addr, &local_len) != 0) {
+		free(local_addr);
+		return -1;
+	}
+
+	/* Send: 4-byte length prefix + address */
+	uint32_t net_len = htonl((uint32_t)local_len);
+	if (send(sock, &net_len, 4, MSG_NOSIGNAL) != 4) { free(local_addr); return -1; }
+	if (send(sock, local_addr, local_len, MSG_NOSIGNAL) != (ssize_t)local_len) { free(local_addr); return -1; }
+	free(local_addr);
+
+	/* Receive peer address */
+	uint32_t peer_len_net;
+	if (recv(sock, &peer_len_net, 4, MSG_WAITALL) != 4) return -1;
+	size_t peer_len = ntohl(peer_len_net);
+	void *peer_addr = malloc(peer_len);
+	if (recv(sock, peer_addr, peer_len, MSG_WAITALL) != (ssize_t)peer_len) { free(peer_addr); return -1; }
+
+	*peer_addr_out = peer_addr;
+	*peer_addrlen_out = peer_len;
+	return 0;
+}
+
+/* Listener sideband thread: accepts TCP connections, exchanges fabric addresses,
+ * inserts peer into AV, then allocates an nng pipe for that peer. */
+static void
+ofi_rdm_listener_sideband(void *arg)
+{
+	ofi_ep *ep = arg;
+	while (!ep->closed) {
+		struct sockaddr_storage ss;
+		socklen_t sslen = sizeof(ss);
+		int conn = accept(ep->rdm_tcp_fd, (struct sockaddr *)&ss, &sslen);
+		if (conn < 0) break; /* fd closed by ofi_listener_close */
+
+		void *peer_addr = NULL;
+		size_t peer_addrlen = 0;
+		if (ofi_sideband_exchange(conn, &ep->ep->fid, &peer_addr, &peer_addrlen) != 0) {
+			close(conn);
+			continue;
+		}
+		close(conn);
+
+		fi_addr_t pa;
+		if (fi_av_insert(ep->av, peer_addr, 1, &pa, 0, NULL) != 1) {
+			free(peer_addr);
+			continue;
+		}
+		free(peer_addr);
+
+		ofi_pipe_alloc(ep, ep->ep, ep->rdm_tcq, ep->rdm_rcq, false, pa);
+	}
+}
+
 static void ofi_ep_eq_thread(void *arg) {
 	ofi_ep *ep = arg;
 	struct fi_eq_cm_entry entry;
@@ -360,6 +435,7 @@ static void ofi_tran_fini(void) {}
 
 static nng_err ofi_listener_init(void *arg, nng_url *url, nni_listener *nl) {
 	ofi_ep *ep = arg; memset(ep, 0, sizeof(*ep)); nni_mtx_init(&ep->mtx);
+	ep->rdm_tcp_fd = -1;
 	NNI_LIST_INIT(&ep->waitpipes, ofi_pipe, node); ep->nlistener = nl; ep->proto = nni_sock_proto_id(nni_listener_sock(nl));
 	char svc[8]; sprintf(svc, "%u", url->u_port);
 	struct fi_info *hints = fi_allocinfo(); hints->ep_attr->type = ofi_ep_type; hints->caps = FI_MSG;
@@ -370,11 +446,14 @@ static nng_err ofi_listener_init(void *arg, nng_url *url, nni_listener *nl) {
 		struct fi_eq_attr eattr = { .size = 256, .wait_obj = FI_WAIT_UNSPEC };
 		fi_eq_open(ofi_fabric, &eattr, &ep->eq, NULL);
 		fi_pep_bind(ep->pep, &ep->eq->fid, 0);
-	} else if (info != NULL) {
+	} else {
+		/* RDM: create AV unconditionally — CXI won't resolve IP in fi_getinfo */
 		struct fi_av_attr aattr = { .type = FI_AV_MAP, .count = 128 };
-		fi_endpoint(ofi_domain, info, &ep->ep, NULL);
+		struct fi_info *rdm_info = info ? info : ofi_base_info;
+		fi_endpoint(ofi_domain, rdm_info, &ep->ep, NULL);
 		fi_av_open(ofi_domain, &aattr, &ep->av, NULL);
 		fi_ep_bind(ep->ep, &ep->av->fid, 0);
+		ep->rdm_url_port = url->u_port;
 	}
 	if (info) fi_freeinfo(info); fi_freeinfo(hints); return 0;
 }
@@ -390,9 +469,25 @@ static nng_err ofi_listener_bind(void *arg, nng_url *url) {
 		}
 	} else if (ep->ep != NULL) {
 		struct fi_cq_attr cattr = { .size = 64, .format = FI_CQ_FORMAT_MSG, .wait_obj = FI_WAIT_FD };
-		struct fid_cq *tcq, *rcq; fi_cq_open(ofi_domain, &cattr, &tcq, NULL); fi_cq_open(ofi_domain, &cattr, &rcq, NULL);
-		fi_ep_bind(ep->ep, &tcq->fid, FI_TRANSMIT); fi_ep_bind(ep->ep, &rcq->fid, FI_RECV);
-		fi_enable(ep->ep); ofi_pipe_alloc(ep, ep->ep, tcq, rcq, false, FI_ADDR_UNSPEC);
+		fi_cq_open(ofi_domain, &cattr, &ep->rdm_tcq, NULL);
+		fi_cq_open(ofi_domain, &cattr, &ep->rdm_rcq, NULL);
+		fi_ep_bind(ep->ep, &ep->rdm_tcq->fid, FI_TRANSMIT);
+		fi_ep_bind(ep->ep, &ep->rdm_rcq->fid, FI_RECV);
+		fi_enable(ep->ep);
+
+		/* Open TCP sideband listen socket */
+		struct sockaddr_in sin = { .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY,
+		                           .sin_port = htons(ep->rdm_url_port) };
+		int sfd = socket(AF_INET, SOCK_STREAM, 0);
+		int one = 1; setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		bind(sfd, (struct sockaddr *)&sin, sizeof(sin));
+		listen(sfd, 64);
+		ep->rdm_tcp_fd = sfd;
+
+		nni_thr_init(&ep->rdm_sideband_thr, ofi_rdm_listener_sideband, ep);
+		nni_thr_run(&ep->rdm_sideband_thr);
+		ep->rdm_sideband_started = true;
+		/* Do NOT call ofi_pipe_alloc here — wait for sideband to exchange addresses */
 	}
 	return 0;
 }
@@ -402,8 +497,21 @@ static void ofi_listener_accept(void *arg, nni_aio *aio) {
 	if (p) { nni_list_remove(&ep->waitpipes, p); nni_mtx_unlock(&ep->mtx); nni_aio_set_output(aio, 0, p->npipe); nni_aio_finish(aio, 0, 0); }
 	else { ep->useraio = aio; nni_mtx_unlock(&ep->mtx); }
 }
-static void ofi_listener_close(void *arg) { ofi_ep *ep = arg; nni_mtx_lock(&ep->mtx); ep->closed = true; nni_mtx_unlock(&ep->mtx); }
-static void ofi_listener_stop(void *arg) { ofi_ep *ep = arg; if (ep->eq_thr_started) nni_thr_fini(&ep->eq_thr); }
+static void ofi_listener_close(void *arg) {
+	ofi_ep *ep = arg;
+	nni_mtx_lock(&ep->mtx);
+	ep->closed = true;
+	nni_mtx_unlock(&ep->mtx);
+	if (ep->rdm_tcp_fd >= 0) {
+		close(ep->rdm_tcp_fd);
+		ep->rdm_tcp_fd = -1;
+	}
+}
+static void ofi_listener_stop(void *arg) {
+	ofi_ep *ep = arg;
+	if (ep->eq_thr_started) nni_thr_fini(&ep->eq_thr);
+	if (ep->rdm_sideband_started) nni_thr_fini(&ep->rdm_sideband_thr);
+}
 static nng_err ofi_listener_getopt(void *a, const char *n, void *v, size_t *s, nni_type t) { return NNG_ENOTSUP; }
 static nng_err ofi_listener_setopt(void *a, const char *n, const void *v, size_t s, nni_type t) { return NNG_ENOTSUP; }
 
@@ -415,17 +523,21 @@ static nni_sp_listener_ops ofi_listener_ops = {
 
 static nng_err ofi_dialer_init(void *arg, nng_url *url, nni_dialer *nd) {
 	ofi_ep *ep = arg; memset(ep, 0, sizeof(*ep)); nni_mtx_init(&ep->mtx); ep->ndialer = nd; ep->is_dialer = true;
+	ep->rdm_tcp_fd = -1;
 	ep->proto = nni_sock_proto_id(nni_dialer_sock(nd)); char svc[8]; sprintf(svc, "%u", url->u_port);
 	struct fi_info *hints = fi_allocinfo(); hints->ep_attr->type = ofi_ep_type; hints->caps = FI_MSG;
 	struct fi_info *info = NULL; fi_getinfo(FI_VERSION(1, 11), url->u_hostname, svc, 0, hints, &info);
 	if (info != NULL) {
 		ep->dest_addr = nni_alloc(info->dest_addrlen); ep->dest_addrlen = info->dest_addrlen; memcpy(ep->dest_addr, info->dest_addr, info->dest_addrlen);
-		if (ofi_ep_type == FI_EP_MSG) {
-			struct fi_eq_attr eattr = { .size = 64, .wait_obj = FI_WAIT_UNSPEC }; fi_eq_open(ofi_fabric, &eattr, &ep->eq, NULL);
-		} else {
-			struct fi_av_attr aattr = { .type = FI_AV_MAP, .count = 128 }; fi_av_open(ofi_domain, &aattr, &ep->av, NULL);
-		}
 		fi_freeinfo(info);
+	}
+	if (ofi_ep_type == FI_EP_MSG) {
+		struct fi_eq_attr eattr = { .size = 64, .wait_obj = FI_WAIT_UNSPEC }; fi_eq_open(ofi_fabric, &eattr, &ep->eq, NULL);
+	} else {
+		/* Create AV unconditionally — CXI won't resolve IP addresses */
+		struct fi_av_attr aattr = { .type = FI_AV_MAP, .count = 128 }; fi_av_open(ofi_domain, &aattr, &ep->av, NULL);
+		ep->rdm_dest_host = nni_strdup(url->u_hostname);
+		ep->rdm_url_port = url->u_port;
 	}
 	fi_freeinfo(hints); return 0;
 }
@@ -440,13 +552,52 @@ static void ofi_dialer_connect(void *arg, nni_aio *aio) {
 		ep->dial_ep = nep; ep->dial_tx_cq = tcq; ep->dial_rx_cq = rcq; ep->useraio = aio;
 		if (!ep->eq_thr_started) { nni_thr_init(&ep->eq_thr, ofi_ep_eq_thread, ep); nni_thr_run(&ep->eq_thr); ep->eq_thr_started = true; }
 	} else {
-		fi_ep_bind(nep, &ep->av->fid, 0); fi_cq_open(ofi_domain, &cattr, &tcq, NULL); fi_cq_open(ofi_domain, &cattr, &rcq, NULL);
-		fi_ep_bind(nep, &tcq->fid, FI_TRANSMIT); fi_ep_bind(nep, &rcq->fid, FI_RECV);
-		fi_addr_t pa; fi_av_insert(ep->av, ep->dest_addr, 1, &pa, 0, NULL);
-		fi_enable(nep); ep->useraio = aio; ofi_pipe_alloc(ep, nep, tcq, rcq, true, pa);
+		fi_ep_bind(nep, &ep->av->fid, 0);
+		fi_cq_open(ofi_domain, &cattr, &tcq, NULL);
+		fi_cq_open(ofi_domain, &cattr, &rcq, NULL);
+		fi_ep_bind(nep, &tcq->fid, FI_TRANSMIT);
+		fi_ep_bind(nep, &rcq->fid, FI_RECV);
+		fi_enable(nep);
+		ep->useraio = aio;
+
+		if (ep->dest_addr != NULL) {
+			/* Normal RDM path: fi_getinfo resolved the address */
+			fi_addr_t pa;
+			fi_av_insert(ep->av, ep->dest_addr, 1, &pa, 0, NULL);
+			ofi_pipe_alloc(ep, nep, tcq, rcq, true, pa);
+		} else {
+			/* CXI path: fi_getinfo failed — use TCP sideband to exchange fabric addresses */
+			struct addrinfo hints_ai = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+			struct addrinfo *res = NULL;
+			char port_str[8]; snprintf(port_str, sizeof(port_str), "%u", ep->rdm_url_port);
+			getaddrinfo(ep->rdm_dest_host, port_str, &hints_ai, &res);
+
+			int sfd = socket(AF_INET, SOCK_STREAM, 0);
+			connect(sfd, res->ai_addr, res->ai_addrlen);
+			freeaddrinfo(res);
+
+			void *peer_addr = NULL; size_t peer_addrlen = 0;
+			if (ofi_sideband_exchange(sfd, &nep->fid, &peer_addr, &peer_addrlen) != 0) {
+				close(sfd);
+				nni_aio_finish_error(aio, NNG_ETRANERR);
+				return;
+			}
+			close(sfd);
+
+			fi_addr_t pa;
+			fi_av_insert(ep->av, peer_addr, 1, &pa, 0, NULL);
+			free(peer_addr);
+			ofi_pipe_alloc(ep, nep, tcq, rcq, true, pa);
+		}
 	}
 }
-static void ofi_dialer_close(void *arg) { ofi_ep *ep = arg; nni_mtx_lock(&ep->mtx); ep->closed = true; nni_mtx_unlock(&ep->mtx); }
+static void ofi_dialer_close(void *arg) {
+	ofi_ep *ep = arg;
+	nni_mtx_lock(&ep->mtx);
+	ep->closed = true;
+	nni_mtx_unlock(&ep->mtx);
+	if (ep->rdm_dest_host) { nni_strfree(ep->rdm_dest_host); ep->rdm_dest_host = NULL; }
+}
 static nng_err ofi_dialer_getopt(void *a, const char *n, void *v, size_t *s, nni_type t) { return NNG_ENOTSUP; }
 static nng_err ofi_dialer_setopt(void *a, const char *n, const void *v, size_t s, nni_type t) { return NNG_ENOTSUP; }
 
