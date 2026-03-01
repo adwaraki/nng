@@ -7,46 +7,87 @@
 #include "../../../testing/nuts.h"
 #include "../../../sp/transport.h"
 
+// Standard NUTS transport test battery (11 tests).
+NUTS_DECLARE_TRAN_TESTS(ofi)
+
+// --- Per-protocol exchange tests ---
+
 void
 test_ofi_scheme_recognized(void)
 {
-	// nni_sp_tran_find is internal API exposed via nng_testing.
 	NUTS_TRUE(nni_sp_tran_find("ofi") != NULL);
 }
 
 void
-test_ofi_listen(void)
+test_ofi_pair0_exchange(void)
 {
-	nng_socket s;
+	nng_socket s1, s2;
+	nng_msg   *msg;
 	char       addr[64];
 
 	nuts_scratch_addr("ofi", sizeof(addr), addr);
-	NUTS_OPEN(s);
-	NUTS_PASS(nng_listen(s, addr, NULL, 0));
-	NUTS_CLOSE(s);
-}
-
-void
-test_ofi_connect(void)
-{
-	nng_socket s1;
-	nng_socket s2;
-	char       addr[64];
-
-	nuts_scratch_addr("ofi", sizeof(addr), addr);
-	NUTS_OPEN(s1);
-	NUTS_OPEN(s2);
+	NUTS_PASS(nng_pair0_open(&s1));
+	NUTS_PASS(nng_pair0_open(&s2));
 	NUTS_PASS(nng_listen(s1, addr, NULL, 0));
 	NUTS_PASS(nng_dial(s2, addr, NULL, 0));
-	nng_msleep(100);
-	NUTS_CLOSE(s1);
-	NUTS_CLOSE(s2);
+	nng_msleep(200);
+
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "pair0", 6));
+	NUTS_PASS(nng_sendmsg(s1, msg, 0));
+	NUTS_PASS(nng_recvmsg(s2, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 6);
+	NUTS_MATCH(nng_msg_body(msg), "pair0");
+	nng_msg_free(msg);
+
+	// Reverse direction
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "reply", 6));
+	NUTS_PASS(nng_sendmsg(s2, msg, 0));
+	NUTS_PASS(nng_recvmsg(s1, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 6);
+	NUTS_MATCH(nng_msg_body(msg), "reply");
+	nng_msg_free(msg);
+
+	nng_socket_close(s1);
+	nng_socket_close(s2);
 }
 
 void
-test_ofi_exchange(void)
+test_ofi_reqrep_exchange(void)
 {
-	nuts_tran_exchange("ofi");
+	nng_socket req, rep;
+	nng_msg   *msg;
+	char       addr[64];
+
+	nuts_scratch_addr("ofi", sizeof(addr), addr);
+	NUTS_PASS(nng_rep0_open(&rep));
+	NUTS_PASS(nng_req0_open(&req));
+	NUTS_PASS(nng_socket_set_ms(req, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_socket_set_ms(rep, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_listen(rep, addr, NULL, 0));
+	NUTS_PASS(nng_dial(req, addr, NULL, 0));
+	nng_msleep(200);
+
+	// REQ sends, REP receives and replies
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "request", 8));
+	NUTS_PASS(nng_sendmsg(req, msg, 0));
+	NUTS_PASS(nng_recvmsg(rep, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 8);
+	NUTS_MATCH(nng_msg_body(msg), "request");
+
+	// REP replies
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "reply", 6));
+	NUTS_PASS(nng_sendmsg(rep, msg, 0));
+	NUTS_PASS(nng_recvmsg(req, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 6);
+	NUTS_MATCH(nng_msg_body(msg), "reply");
+	nng_msg_free(msg);
+
+	nng_socket_close(req);
+	nng_socket_close(rep);
 }
 
 /*
@@ -216,13 +257,239 @@ test_ofi_concurrent_pipes(void)
 	NUTS_CLOSE(listener_sock);
 }
 
+void
+test_ofi_pubsub_delivery(void)
+{
+	nng_socket pub, sub;
+	nng_msg   *msg;
+	char       addr[64];
+
+	nuts_scratch_addr("ofi", sizeof(addr), addr);
+	NUTS_PASS(nng_pub0_open(&pub));
+	NUTS_PASS(nng_sub0_open(&sub));
+	NUTS_PASS(nng_sub0_socket_subscribe(sub, NULL, 0));
+	NUTS_PASS(nng_socket_set_ms(sub, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_listen(pub, addr, NULL, 0));
+	NUTS_PASS(nng_dial(sub, addr, NULL, 0));
+	nng_msleep(200);
+
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "hello", 6));
+	NUTS_PASS(nng_sendmsg(pub, msg, 0));
+	NUTS_PASS(nng_recvmsg(sub, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 6);
+	NUTS_MATCH(nng_msg_body(msg), "hello");
+	nng_msg_free(msg);
+
+	nng_socket_close(pub);
+	nng_socket_close(sub);
+}
+
+void
+test_ofi_pipeline_delivery(void)
+{
+	nng_socket push, pull;
+	nng_msg   *msg;
+	char       addr[64];
+
+	nuts_scratch_addr("ofi", sizeof(addr), addr);
+	NUTS_PASS(nng_push0_open(&push));
+	NUTS_PASS(nng_pull0_open(&pull));
+	NUTS_PASS(nng_socket_set_ms(pull, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_listen(pull, addr, NULL, 0));
+	NUTS_PASS(nng_dial(push, addr, NULL, 0));
+	nng_msleep(200);
+
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "pushed", 7));
+	NUTS_PASS(nng_sendmsg(push, msg, 0));
+	NUTS_PASS(nng_recvmsg(pull, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 7);
+	NUTS_MATCH(nng_msg_body(msg), "pushed");
+	nng_msg_free(msg);
+
+	nng_socket_close(push);
+	nng_socket_close(pull);
+}
+
+void
+test_ofi_bus_exchange(void)
+{
+	nng_socket b1, b2;
+	nng_msg   *msg;
+	char       addr[64];
+
+	nuts_scratch_addr("ofi", sizeof(addr), addr);
+	NUTS_PASS(nng_bus0_open(&b1));
+	NUTS_PASS(nng_bus0_open(&b2));
+	NUTS_PASS(nng_socket_set_ms(b1, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_socket_set_ms(b2, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_listen(b1, addr, NULL, 0));
+	NUTS_PASS(nng_dial(b2, addr, NULL, 0));
+	nng_msleep(200);
+
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "bus-1to2", 9));
+	NUTS_PASS(nng_sendmsg(b1, msg, 0));
+	NUTS_PASS(nng_recvmsg(b2, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 9);
+	NUTS_MATCH(nng_msg_body(msg), "bus-1to2");
+	nng_msg_free(msg);
+
+	// Reverse direction
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "bus-2to1", 9));
+	NUTS_PASS(nng_sendmsg(b2, msg, 0));
+	NUTS_PASS(nng_recvmsg(b1, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 9);
+	NUTS_MATCH(nng_msg_body(msg), "bus-2to1");
+	nng_msg_free(msg);
+
+	nng_socket_close(b1);
+	nng_socket_close(b2);
+}
+
+void
+test_ofi_survey_exchange(void)
+{
+	nng_socket surv, resp;
+	nng_msg   *msg;
+	char       addr[64];
+
+	nuts_scratch_addr("ofi", sizeof(addr), addr);
+	NUTS_PASS(nng_surveyor0_open(&surv));
+	NUTS_PASS(nng_respondent0_open(&resp));
+	NUTS_PASS(nng_socket_set_ms(surv, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_socket_set_ms(resp, NNG_OPT_RECVTIMEO, 5000));
+	NUTS_PASS(nng_socket_set_ms(
+	    surv, NNG_OPT_SURVEYOR_SURVEYTIME, 5000));
+	NUTS_PASS(nng_listen(surv, addr, NULL, 0));
+	NUTS_PASS(nng_dial(resp, addr, NULL, 0));
+	nng_msleep(200);
+
+	// Surveyor sends survey
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "survey", 7));
+	NUTS_PASS(nng_sendmsg(surv, msg, 0));
+	NUTS_PASS(nng_recvmsg(resp, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 7);
+	NUTS_MATCH(nng_msg_body(msg), "survey");
+
+	// Respondent replies
+	NUTS_PASS(nng_msg_alloc(&msg, 0));
+	NUTS_PASS(nng_msg_append(msg, "response", 9));
+	NUTS_PASS(nng_sendmsg(resp, msg, 0));
+	NUTS_PASS(nng_recvmsg(surv, &msg, 0));
+	NUTS_TRUE(nng_msg_len(msg) == 9);
+	NUTS_MATCH(nng_msg_body(msg), "response");
+	nng_msg_free(msg);
+
+	nng_socket_close(surv);
+	nng_socket_close(resp);
+}
+
+// --- Multi-message burst test ---
+
+void
+test_ofi_burst(void)
+{
+	nng_socket s1, s2;
+	nng_msg   *msg;
+	char       addr[64];
+	int        count = 50;
+
+	nuts_scratch_addr("ofi", sizeof(addr), addr);
+	NUTS_PASS(nng_pair1_open(&s1));
+	NUTS_PASS(nng_pair1_open(&s2));
+	NUTS_PASS(nng_socket_set_ms(s1, NNG_OPT_RECVTIMEO, 10000));
+	NUTS_PASS(nng_socket_set_ms(s2, NNG_OPT_RECVTIMEO, 10000));
+	NUTS_PASS(nng_listen(s1, addr, NULL, 0));
+	NUTS_PASS(nng_dial(s2, addr, NULL, 0));
+	nng_msleep(200);
+
+	for (int i = 0; i < count; i++) {
+		NUTS_PASS(nng_msg_alloc(&msg, 0));
+		NUTS_PASS(nng_msg_append_u32(msg, (uint32_t) i));
+		NUTS_PASS(nng_sendmsg(s2, msg, 0));
+	}
+	for (int i = 0; i < count; i++) {
+		uint32_t val;
+		NUTS_PASS(nng_recvmsg(s1, &msg, 0));
+		NUTS_PASS(nng_msg_trim_u32(msg, &val));
+		NUTS_TRUE(val == (uint32_t) i);
+		nng_msg_free(msg);
+	}
+
+	nng_socket_close(s1);
+	nng_socket_close(s2);
+}
+
+// --- Large message size boundary test ---
+
+void
+test_ofi_large_msg(void)
+{
+	nng_socket s1, s2;
+	nng_msg   *msg;
+	char       addr[64];
+
+	nuts_scratch_addr("ofi", sizeof(addr), addr);
+	NUTS_PASS(nng_pair1_open(&s1));
+	NUTS_PASS(nng_pair1_open(&s2));
+	NUTS_PASS(nng_socket_set_ms(s1, NNG_OPT_RECVTIMEO, 10000));
+	NUTS_PASS(nng_socket_set_ms(s2, NNG_OPT_RECVTIMEO, 10000));
+	NUTS_PASS(nng_listen(s1, addr, NULL, 0));
+	NUTS_PASS(nng_dial(s2, addr, NULL, 0));
+	nng_msleep(200);
+
+	// Test sizes: 64KB, 256KB
+	size_t sizes[] = { 65536, 262144 };
+	for (int t = 0; t < 2; t++) {
+		size_t sz = sizes[t];
+		NUTS_PASS(nng_msg_alloc(&msg, sz));
+		uint8_t *body = nng_msg_body(msg);
+		for (size_t j = 0; j < sz; j++) {
+			body[j] = (uint8_t)(j & 0xFF);
+		}
+		NUTS_PASS(nng_sendmsg(s2, msg, 0));
+		NUTS_PASS(nng_recvmsg(s1, &msg, 0));
+		NUTS_TRUE(nng_msg_len(msg) == sz);
+		body = nng_msg_body(msg);
+		for (size_t j = 0; j < sz; j++) {
+			if (body[j] != (uint8_t)(j & 0xFF)) {
+				NUTS_TRUE(false);
+				break;
+			}
+		}
+		nng_msg_free(msg);
+	}
+
+	nng_socket_close(s1);
+	nng_socket_close(s2);
+}
+
+// clang-format off
 TEST_LIST = {
-	{ "ofi-scheme-recognized", test_ofi_scheme_recognized },
-	{ "ofi-listen", test_ofi_listen },
-	{ "ofi-connect", test_ofi_connect },
-	{ "ofi-exchange", test_ofi_exchange },
-	{ "ofi-large-message", test_ofi_large_message },
-	{ "ofi-reconnect", test_ofi_reconnect },
-	{ "ofi-concurrent-pipes", test_ofi_concurrent_pipes },
+	{ "ofi scheme recognized", test_ofi_scheme_recognized },
+
+	// Standard NUTS transport battery (11 tests)
+	NUTS_INSERT_TRAN_TESTS(ofi),
+
+	// Per-protocol exchange tests
+	{ "ofi pair0 exchange", test_ofi_pair0_exchange },
+	{ "ofi reqrep exchange", test_ofi_reqrep_exchange },
+	{ "ofi pubsub delivery", test_ofi_pubsub_delivery },
+	{ "ofi pipeline delivery", test_ofi_pipeline_delivery },
+	{ "ofi bus exchange", test_ofi_bus_exchange },
+	{ "ofi survey exchange", test_ofi_survey_exchange },
+
+	// Stress / boundary tests
+	{ "ofi burst", test_ofi_burst },
+	{ "ofi large msg", test_ofi_large_msg },
+	{ "ofi large message rejection", test_ofi_large_message },
+	{ "ofi reconnect", test_ofi_reconnect },
+	{ "ofi concurrent pipes", test_ofi_concurrent_pipes },
+
 	{ NULL, NULL },
 };
+// clang-format on
