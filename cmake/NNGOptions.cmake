@@ -150,6 +150,9 @@ if (NNG_TRANSPORT_OFI)
     set(NNG_OFI_PROVIDER "" CACHE STRING
         "libfabric provider name (empty=auto, 'tcp' for local test, 'cxi' for Slingshot)")
     mark_as_advanced(NNG_OFI_PROVIDER)
+    set(NNG_OFI_BOUNCE_SIZE "" CACHE STRING
+        "OFI bounce buffer size in bytes (default 4 MiB = 4194304)")
+    mark_as_advanced(NNG_OFI_BOUNCE_SIZE)
 endif ()
 
 if (NNG_TRANSPORT_WS OR NNG_TRANSPORT_WSS)

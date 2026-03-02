@@ -4,8 +4,8 @@
 // copy of which should be located in the distribution where this
 // file was obtained (LICENSE.txt).
 
-#include "../../../testing/nuts.h"
 #include "../../../sp/transport.h"
+#include "../../../testing/nuts.h"
 
 // Standard NUTS transport test battery (11 tests).
 NUTS_DECLARE_TRAN_TESTS(ofi)
@@ -92,9 +92,9 @@ test_ofi_reqrep_exchange(void)
 
 /*
  * test_ofi_large_message: verify that sending a message larger than the
- * OFI bounce buffer (OFI_BOUNCE_SZ = 1 MiB) fails with NNG_EMSGSIZE rather
- * than silently corrupting the heap.  The fix for C2 in ofi_pipe_do_send adds
- * this bounds check.
+ * OFI bounce buffer (OFI_BOUNCE_SZ, default 4 MiB) fails with NNG_EMSGSIZE
+ * rather than silently corrupting the heap.  The fix for C2 in
+ * ofi_pipe_do_send adds this bounds check.
  */
 void
 test_ofi_large_message(void)
@@ -103,10 +103,10 @@ test_ofi_large_message(void)
 	nng_socket s2;
 	nng_msg   *msg;
 	char       addr[64];
-	/* OFI_BOUNCE_SZ is 1 MiB; header+body must fit in that minus 8 bytes.
-	 * Allocate a body that is exactly OFI_BOUNCE_SZ bytes so that
-	 * total+8 overflows the bounce buffer. */
-	const size_t oversized = (1024 * 1024);
+	/* OFI_BOUNCE_SZ is 4 MiB by default; header+body must fit in that
+	 * minus 8 bytes.  Allocate a body of exactly 4 MiB so that total+8
+	 * overflows the bounce buffer. */
+	const size_t oversized = (4 * 1024 * 1024);
 
 	nuts_scratch_addr("ofi", sizeof(addr), addr);
 	NUTS_OPEN(s1);
@@ -365,8 +365,7 @@ test_ofi_survey_exchange(void)
 	NUTS_PASS(nng_respondent0_open(&resp));
 	NUTS_PASS(nng_socket_set_ms(surv, NNG_OPT_RECVTIMEO, 5000));
 	NUTS_PASS(nng_socket_set_ms(resp, NNG_OPT_RECVTIMEO, 5000));
-	NUTS_PASS(nng_socket_set_ms(
-	    surv, NNG_OPT_SURVEYOR_SURVEYTIME, 5000));
+	NUTS_PASS(nng_socket_set_ms(surv, NNG_OPT_SURVEYOR_SURVEYTIME, 5000));
 	NUTS_PASS(nng_listen(surv, addr, NULL, 0));
 	NUTS_PASS(nng_dial(resp, addr, NULL, 0));
 	nng_msleep(200);
@@ -447,20 +446,22 @@ test_ofi_large_msg(void)
 	nng_msleep(200);
 
 	// Test sizes: 64KB, 256KB
-	size_t sizes[] = { 65536, 262144 };
-	for (int t = 0; t < 2; t++) {
+	// 1 MiB is included to verify the bounce buffer increase fixed
+	// the deadlock at the old 1,048,564-byte boundary.
+	size_t sizes[] = { 65536, 262144, 1048576 };
+	for (int t = 0; t < 3; t++) {
 		size_t sz = sizes[t];
 		NUTS_PASS(nng_msg_alloc(&msg, sz));
 		uint8_t *body = nng_msg_body(msg);
 		for (size_t j = 0; j < sz; j++) {
-			body[j] = (uint8_t)(j & 0xFF);
+			body[j] = (uint8_t) (j & 0xFF);
 		}
 		NUTS_PASS(nng_sendmsg(s2, msg, 0));
 		NUTS_PASS(nng_recvmsg(s1, &msg, 0));
 		NUTS_TRUE(nng_msg_len(msg) == sz);
 		body = nng_msg_body(msg);
 		for (size_t j = 0; j < sz; j++) {
-			if (body[j] != (uint8_t)(j & 0xFF)) {
+			if (body[j] != (uint8_t) (j & 0xFF)) {
 				NUTS_TRUE(false);
 				break;
 			}

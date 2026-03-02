@@ -31,7 +31,15 @@
 typedef struct ofi_pipe ofi_pipe;
 typedef struct ofi_ep   ofi_ep;
 
-#define OFI_BOUNCE_SZ (1024 * 1024)
+/* Default bounce buffer size: 4 MiB.  Each pipe allocates two buffers
+ * (TX + RX) and registers them as memory regions, so total registered
+ * memory per pipe is 2 * OFI_BOUNCE_SZ.  Override at build time via
+ * -DNNG_OFI_BOUNCE_SIZE=<bytes> in CMake. */
+#ifdef NNG_OFI_BOUNCE_SIZE
+#define OFI_BOUNCE_SZ NNG_OFI_BOUNCE_SIZE
+#else
+#define OFI_BOUNCE_SZ (4 * 1024 * 1024)
+#endif
 #define OFI_NEGO_SZ 8
 #define OFI_MAX_ADDR_LEN 4096
 
