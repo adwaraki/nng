@@ -73,11 +73,11 @@ struct ofi_ep {
 };
 
 struct ofi_pipe {
-	ofi_ep        *oep;
-	nni_pipe      *npipe;
-	uint16_t       peer;
-	uint16_t       proto;
-	bool           closed;
+	ofi_ep   *oep;
+	nni_pipe *npipe;
+	uint16_t  peer;
+	uint16_t  proto;
+	bool      closed;
 	/* C3: true only when this pipe exclusively owns ep/tx_cq/rx_cq
 	 * (FI_EP_MSG per-connection endpoints).  RDM pipes share these
 	 * resources with the listener endpoint and must NOT close them. */
@@ -166,45 +166,45 @@ ofi_pipe_nego_complete(ofi_pipe *p, bool success)
 static void
 ofi_pipe_do_send(ofi_pipe *p)
 {
-	nni_aio *aio = nni_list_first(&p->sendq);
-	if (!aio)
-		return;
-	nni_msg *msg   = nni_aio_get_msg(aio);
-	size_t   hlen  = nni_msg_header_len(msg);
-	size_t   blen  = nni_msg_len(msg);
-	size_t   total = hlen + blen;
-	/* C2: guard against heap overflow on TX */
-	if (total + 8 > OFI_BOUNCE_SZ) {
-		nni_aio_list_remove(aio);
-		nni_mtx_unlock(&p->mtx);
-		nni_aio_finish_error(aio, NNG_EMSGSIZE);
-		nni_mtx_lock(&p->mtx);
-		/* H2: dispatch the next queued AIO so the send queue
-		 * does not stall after an error */
-		ofi_pipe_do_send(p);
-		return;
-	}
-	NNI_PUT64((uint8_t *) p->tx_buf, (uint64_t) total);
-	memcpy((uint8_t *) p->tx_buf + 8, nni_msg_header(msg), hlen);
-	memcpy((uint8_t *) p->tx_buf + 8 + hlen, nni_msg_body(msg), blen);
-	struct iovec  iov  = { .iov_base = p->tx_buf, .iov_len = total + 8 };
-	struct fi_msg fmsg = { .msg_iov = &iov,
-		.iov_count              = 1,
-		.desc                   = fi_mr_desc(p->tx_mr),
-		.addr = (ofi_ep_type == FI_EP_RDM) ? p->addr : FI_ADDR_UNSPEC,
-		.context = aio };
-	int           rv   = fi_sendmsg(p->ep, &fmsg, 0);
-	if (rv != 0) {
-		nni_aio_list_remove(aio);
-		nni_mtx_unlock(&p->mtx);
-		nni_aio_finish_error(aio, ofi_err(rv));
-		nni_mtx_lock(&p->mtx);
-		/* H2: dispatch the next queued AIO so the send queue
-		 * does not stall after an error */
-		ofi_pipe_do_send(p);
+	nni_aio *aio;
+	/* N4: iterative loop replaces previous recursive calls to avoid
+	 * unbounded stack growth on error bursts. */
+	while ((aio = nni_list_first(&p->sendq)) != NULL) {
+		nni_msg *msg   = nni_aio_get_msg(aio);
+		size_t   hlen  = nni_msg_header_len(msg);
+		size_t   blen  = nni_msg_len(msg);
+		size_t   total = hlen + blen;
+		/* C2: guard against heap overflow on TX */
+		if (total + 8 > OFI_BOUNCE_SZ) {
+			nni_aio_list_remove(aio);
+			nni_mtx_unlock(&p->mtx);
+			nni_aio_finish_error(aio, NNG_EMSGSIZE);
+			nni_mtx_lock(&p->mtx);
+			continue; /* try next queued AIO */
+		}
+		NNI_PUT64((uint8_t *) p->tx_buf, (uint64_t) total);
+		memcpy((uint8_t *) p->tx_buf + 8, nni_msg_header(msg), hlen);
+		memcpy(
+		    (uint8_t *) p->tx_buf + 8 + hlen, nni_msg_body(msg), blen);
+		struct iovec  iov  = { .iov_base = p->tx_buf,
+			  .iov_len               = total + 8 };
+		struct fi_msg fmsg = { .msg_iov = &iov,
+			.iov_count              = 1,
+			.desc                   = fi_mr_desc(p->tx_mr),
+			.addr    = (ofi_ep_type == FI_EP_RDM) ? p->addr
+			                                      : FI_ADDR_UNSPEC,
+			.context = aio };
+		int           rv   = fi_sendmsg(p->ep, &fmsg, 0);
+		if (rv != 0) {
+			nni_aio_list_remove(aio);
+			nni_mtx_unlock(&p->mtx);
+			nni_aio_finish_error(aio, ofi_err(rv));
+			nni_mtx_lock(&p->mtx);
+			continue; /* try next queued AIO */
+		}
+		break; /* send posted successfully; wait for CQ */
 	}
 }
-
 static void
 ofi_pipe_nego_start(ofi_pipe *p)
 {
@@ -294,18 +294,11 @@ ofi_pipe_drain_cqs(ofi_pipe *p)
 				nni_msg *msg;
 				if (nni_msg_alloc(&msg, (size_t) msglen) !=
 				    0) {
-					struct iovec  iov  = { .iov_base =
-						                   p->rx_buf,
-						  .iov_len = OFI_BOUNCE_SZ };
-					struct fi_msg fmsg = { .msg_iov = &iov,
-						.iov_count              = 1,
-						.desc = fi_mr_desc(p->rx_mr),
-						.addr =
-						    (ofi_ep_type == FI_EP_RDM)
-						    ? p->addr
-						    : FI_ADDR_UNSPEC };
-					fi_recvmsg(p->ep, &fmsg, 0);
-					continue;
+					/* N6: close the pipe on OOM rather
+					 * than silently dropping messages
+					 * forever. */
+					nni_pipe_close(p->npipe);
+					return;
 				}
 				memcpy(nni_msg_body(msg),
 				    (uint8_t *) p->rx_buf + 8,
@@ -363,9 +356,11 @@ ofi_pipe_alloc(ofi_ep *ep, struct fid_ep *fid_ep, struct fid_cq *tx_cq,
 	p->proto    = ep->proto;
 	p->addr     = addr;
 	/* C3: RDM pipes share the listener's ep/CQs and must not close them */
-	p->owns_ep  = (ofi_ep_type == FI_EP_MSG);
-	p->tx_buf   = nni_alloc(OFI_BOUNCE_SZ);
-	p->rx_buf   = nni_alloc(OFI_BOUNCE_SZ);
+	/* N3: RDM dialer pipes create per-connection EP/CQs that must be
+	 * freed.  Only RDM *listener* pipes share the listener's resources. */
+	p->owns_ep = is_dialer || (ofi_ep_type == FI_EP_MSG);
+	p->tx_buf  = nni_alloc(OFI_BOUNCE_SZ);
+	p->rx_buf  = nni_alloc(OFI_BOUNCE_SZ);
 	fi_mr_reg(ofi_domain, p->tx_buf, OFI_BOUNCE_SZ, FI_SEND, 0, 0, 0,
 	    &p->tx_mr, NULL);
 	fi_mr_reg(ofi_domain, p->rx_buf, OFI_BOUNCE_SZ, FI_RECV, 0, 0, 0,
@@ -435,6 +430,43 @@ ofi_sideband_exchange(
 	*peer_addrlen_out = peer_len;
 	return 0;
 }
+
+/*
+ * N1 — KNOWN LIMITATION: RDM shared CQ multiplexing
+ *
+ * In RDM mode, the listener creates ONE shared endpoint (ep->ep) with one
+ * pair of completion queues (ep->rdm_tcq / ep->rdm_rcq).  Every pipe spawned
+ * by the listener shares these resources.  This causes two problems when
+ * multiple peers are connected simultaneously:
+ *
+ *   (a) CQ completion routing: fi_cq_read on the shared rx CQ returns
+ *       completions for ALL peers, but ofi_pipe_drain_cqs processes them
+ *       against a single pipe's rx_buf.  A completion destined for pipe A
+ *       may be consumed by pipe B's poller, causing data corruption.
+ *
+ *   (b) Receive buffer aliasing: all pipes share the same fd (from
+ *       FI_GETWAIT on the shared rx CQ) in nni_posix_pfd, so the epoll
+ *       wakeup triggers every pipe's callback, but only one pipe's rx_buf
+ *       contains the data.
+ *
+ * CONSEQUENCE: RDM listener mode works correctly only with a SINGLE peer
+ * at a time.  Multi-peer RDM requires one of:
+ *
+ *   1. Central CQ dispatcher: a single thread polls the shared CQ and
+ *      routes completions to the correct pipe using fi_addr_t from
+ *      fi_cq_tagged_entry or op_context.  Each pipe would register its
+ *      own AIO context and the dispatcher matches CQ entries to pipes.
+ *
+ *   2. Per-peer endpoint: allocate a dedicated fid_ep + CQ pair per peer
+ *      in ofi_rdm_listener_sideband (if the provider supports multiple
+ *      endpoints on one AV).  This avoids shared state entirely but not
+ *      all providers support it (e.g., CXI has per-PID EP limits).
+ *
+ * This limitation does NOT affect:
+ *   - FI_EP_MSG mode (each pipe always gets its own EP + CQs)
+ *   - RDM dialer mode (each dial creates a fresh EP + CQ pair via N3 fix)
+ *   - Single-peer RDM listener (the common case for point-to-point RDMA)
+ */
 
 /* Listener sideband thread: accepts TCP connections, exchanges fabric
  * addresses, inserts peer into AV, then allocates an nng pipe for that peer.
@@ -565,7 +597,7 @@ ofi_pipe_close(void *arg)
 	nni_msg  *cache;
 
 	nni_mtx_lock(&p->mtx);
-	p->closed = true;
+	p->closed       = true;
 	cache           = p->rx_msg_cache;
 	p->rx_msg_cache = NULL;
 	nni_mtx_unlock(&p->mtx);
@@ -876,12 +908,12 @@ ofi_listener_setopt(
 
 static nni_sp_listener_ops ofi_listener_ops = { .l_size = sizeof(ofi_ep),
 	.l_init                                         = ofi_listener_init,
-	.l_fini   = ofi_listener_fini,
-	.l_bind   = ofi_listener_bind,
-	.l_accept = ofi_listener_accept,
-	.l_close  = ofi_listener_close,
-	.l_stop   = ofi_listener_stop,
-	.l_getopt = ofi_listener_getopt,
+	.l_fini                                         = ofi_listener_fini,
+	.l_bind                                         = ofi_listener_bind,
+	.l_accept                                       = ofi_listener_accept,
+	.l_close                                        = ofi_listener_close,
+	.l_stop                                         = ofi_listener_stop,
+	.l_getopt                                       = ofi_listener_getopt,
 	.l_setopt = ofi_listener_setopt };
 
 static nng_err
@@ -1007,16 +1039,22 @@ ofi_dialer_connect(void *arg, nni_aio *aio)
 		} else {
 			/* CXI path: fi_getinfo failed — use TCP sideband to
 			 * exchange fabric addresses.  H3: run in a background
-			 * thread to avoid blocking the NNG transport thread. */
+			 * thread to avoid blocking the NNG transport thread.
+			 */
 			ep->dial_ep    = nep;
 			ep->dial_tx_cq = tcq;
 			ep->dial_rx_cq = rcq;
-			if (!ep->rdm_sideband_started) {
-				nni_thr_init(&ep->rdm_sideband_thr,
-				    ofi_rdm_dialer_sideband, ep);
-				nni_thr_run(&ep->rdm_sideband_thr);
-				ep->rdm_sideband_started = true;
+			/* N2: the sideband thread is one-shot; if a previous
+			 * connection attempt ran, we must join it before
+			 * re-initializing for a new attempt. */
+			if (ep->rdm_sideband_started) {
+				nni_thr_fini(&ep->rdm_sideband_thr);
+				ep->rdm_sideband_started = false;
 			}
+			nni_thr_init(&ep->rdm_sideband_thr,
+			    ofi_rdm_dialer_sideband, ep);
+			nni_thr_run(&ep->rdm_sideband_thr);
+			ep->rdm_sideband_started = true;
 		}
 	}
 }
@@ -1083,12 +1121,12 @@ ofi_dialer_setopt(void *a, const char *n, const void *v, size_t s, nni_type t)
 
 static nni_sp_dialer_ops ofi_dialer_ops = { .d_size = sizeof(ofi_ep),
 	.d_init                                     = ofi_dialer_init,
-	.d_fini    = ofi_dialer_fini,
-	.d_connect = ofi_dialer_connect,
-	.d_close   = ofi_dialer_close,
-	.d_stop    = ofi_dialer_stop,
-	.d_getopt  = ofi_dialer_getopt,
-	.d_setopt  = ofi_dialer_setopt };
+	.d_fini                                     = ofi_dialer_fini,
+	.d_connect                                  = ofi_dialer_connect,
+	.d_close                                    = ofi_dialer_close,
+	.d_stop                                     = ofi_dialer_stop,
+	.d_getopt                                   = ofi_dialer_getopt,
+	.d_setopt                                   = ofi_dialer_setopt };
 
 static nni_sp_tran ofi_tran = { .tran_scheme = "ofi",
 	.tran_dialer                         = &ofi_dialer_ops,

@@ -271,3 +271,100 @@ The four tests (`ofi-scheme-recognized`, `ofi-listen`, `ofi-connect`,
 | **P1 — Before functional use** | H1 AIO drain on close, H2 TX stall recovery, H4 resource leaks, H5 CQ error drain | Medium — straightforward additions |
 | **P2 — Before multi-peer RDM** | C3 shared endpoint architecture refactor | Large — pipe ownership redesign |
 | **P3 — Before production** | H3 async sideband, M1 wait_fd read removal, M3 global teardown, M4 test coverage | Medium–Large |
+
+---
+
+## Follow-Up Review (2026-03-01)
+
+After implementing all P0–P3 fixes from the initial review, a second consensus
+review was conducted (Claude Opus 4.6 + Gemini 3.1 Pro).  Six new findings
+were identified (N1–N6).
+
+### Status of Initial Findings
+
+All original findings (C1–C4, H1–H5, M1–M4) have been addressed in commit
+`c80030dc`.  Key implementation details:
+
+- **C1/C2:** TX and RX bounds checks guard against bounce buffer overflow
+- **C3:** `owns_ep` flag prevents RDM listener pipes from closing shared resources
+- **C4:** 4096-byte upper bound on sideband address exchange + malloc check
+- **H1:** AIO drain loop in `ofi_pipe_close` with correct lock discipline
+- **H3:** RDM dialer sideband runs in dedicated `nni_thr` background thread
+- **H4:** Separate `fini` functions close all libfabric objects
+- **H5:** `fi_cq_readerr` called when CQ returns `-FI_EAVAIL`
+- **M1:** Direct `read(wait_fd)` removed; rely on `nni_posix_pfd` exclusively
+- **M4:** 3 new tests added (large-message, reconnect, concurrent-pipes)
+
+### N1. RDM Shared CQ Multiplexing — KNOWN LIMITATION (not fixed)
+
+**Severity:** Critical for multi-peer RDM; not applicable to single-peer or MSG mode
+
+In RDM listener mode, all pipes share one endpoint (`ep->ep`) and one pair of
+CQs (`ep->rdm_tcq`, `ep->rdm_rcq`).  CQ completions for different peers are
+interleaved — a completion for pipe A can be consumed by pipe B's poller,
+causing data corruption.  Additionally, all pipes register the same `wait_fd`,
+so epoll wakeups are broadcast to every pipe.
+
+**Impact:** RDM listener mode is limited to **one peer at a time**.
+
+**Required fix:** Either (1) a central CQ dispatcher that routes completions by
+`fi_addr_t` or `op_context`, or (2) per-peer `fid_ep` + CQ allocation in the
+sideband thread.  This is a substantial architectural change documented in the
+source code comment block above `ofi_rdm_listener_sideband`.
+
+### N2. Dialer Reconnect Deadlock — FIXED
+
+**Severity:** High
+
+`rdm_sideband_started` was permanently `true` after the first sideband thread
+launch, blocking NNG's redial mechanism from starting a new thread.
+
+**Fix:** Join the previous thread via `nni_thr_fini` before re-initializing
+and running a new one on each connect attempt.
+
+### N3. RDM Dialer Resource Leak — FIXED
+
+**Severity:** High
+
+`p->owns_ep = (ofi_ep_type == FI_EP_MSG)` did not account for RDM dialer pipes,
+which each create a fresh EP + CQ pair.  These leaked on every pipe teardown.
+
+**Fix:** `p->owns_ep = is_dialer || (ofi_ep_type == FI_EP_MSG)`.
+
+### N4. Recursive `ofi_pipe_do_send` — FIXED
+
+**Severity:** Low
+
+Error paths recursively called `ofi_pipe_do_send`.  Converted to an iterative
+`while` loop with `continue`/`break` to avoid unbounded stack growth.
+
+### N5. Test-Only Observation — DISMISSED
+
+Observation about test architecture; no code change needed.
+
+### N6. OOM Silent Message Drop — FIXED
+
+**Severity:** Medium
+
+When `nni_msg_alloc` failed on the RX path, the code silently re-posted the
+receive buffer and continued, discarding the message with no indication to the
+sender.
+
+**Fix:** Close the pipe on OOM (`nni_pipe_close`) to trigger proper teardown
+rather than silently dropping messages.
+
+---
+
+## Final Assessment
+
+**Status: READY WITH CAVEATS for EXPERIMENTAL use**
+
+All critical, high, and medium findings from both review rounds have been
+addressed except N1 (RDM shared CQ multiplexing), which is documented as a
+known limitation.  The transport is suitable for:
+
+- FI_EP_MSG providers (tcp, verbs): full multi-peer support
+- FI_EP_RDM providers (CXI/Slingshot): single-peer point-to-point only
+- Development, testing, and benchmarking of RDMA-accelerated NNG applications
+
+Multi-peer RDM support requires the architectural changes described in N1.
